@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Normie Interactive Pixel Editor</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 2rem;
+      line-height: 1.5;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 1rem;
+    }
+    label {
+      display: block;
+      margin-top: 0.75rem;
+    }
+    input[type="number"] {
+      width: 100%;
+      max-width: 200px;
+      padding: 0.3rem;
+      margin-top: 0.25rem;
+    }
+    button {
+      margin-top: 0.75rem;
+      margin-right: 0.5rem;
+      padding: 0.4rem 0.8rem;
+      font-size: 1rem;
+    }
+    #normieInfo {
+      margin-top: 1rem;
+      border-top: 1px solid #ccc;
+      padding-top: 1rem;
+    }
+    #canvasContainer {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    .error {
+      color: red;
+    }
+  </style>
+</head>
+<body>
+  <h1>Normie Interactive Pixel Editor</h1>
+  <p>
+    Enter a Normie token ID (0 – 9999) to load its current data and image.  
+    Then you can allocate pixel credits and interactively add or remove pixels using your mouse.  
+    A normal click adds a pixel (fills a light square), while holding the Shift key and clicking removes a pixel.  
+    Edits are confined to the Normie’s bounding box and consume one credit per action.
+  </p>
+
+  <!-- Fetch a single Normie to edit -->
+  <label for="normieId">Normie ID:</label>
+  <input type="number" id="normieId" min="0" max="9999" value="0">
+  <button id="fetchBtn">Fetch Normie</button>
+  <div id="fetchStatus"></div>
+
+  <!-- Burn section: allow the user to enter multiple Normies to burn for edit credits -->
+  <h2>Burn Normies for Edit Credits</h2>
+  <p>
+    Enter the IDs of the Normies you want to burn, separated by commas (e.g., 12,45,78). The app
+    will fetch each Normie’s Pixel Count and calculate the total pixel count. You will receive
+    <strong>1 % of the total pixel count (rounded up)</strong> as edit credits.
+  </p>
+  <label for="burnIds">Normie IDs to burn:</label>
+  <input type="text" id="burnIds" placeholder="e.g. 12, 45, 78">
+  <button id="burnBtn">Compute Credits</button>
+  <div id="burnStatus"></div>
+  <div id="burnInfo"></div>
+
+  <div id="normieInfo" style="display:none;">
+    <h2>Current Normie Stats</h2>
+    <p>Level: <span id="normieLevel"></span></p>
+    <p>Pixel Count: <span id="normiePixels"></span></p>
+
+    <div id="canvasContainer">
+      <div>
+        <h3>Original Normie</h3>
+        <canvas id="originalCanvas"></canvas>
+      </div>
+      <div>
+        <h3>Modified Normie</h3>
+        <canvas id="modifiedCanvas" style="cursor: crosshair;"></canvas>
+      </div>
+    </div>
+
+    <h3>Interactive Editing</h3>
+    <p>
+      Set how many pixel credits you have (or use the computed credits from burning). Each time you click to
+      add or remove a pixel, you use one credit.  A normal click adds a pixel; holding the
+      <strong>Shift</strong> key removes a pixel; holding the <strong>Ctrl</strong> key (or <strong>Command ⌘</strong> on Mac) on a modified pixel
+      will <em>undo</em> that change and refund the credit. Edits are confined to the Normie’s bounding box.
+      When credits reach zero, editing stops.
+    </p>
+    <label for="editCredits">Pixel credits available:</label>
+    <input type="number" id="editCredits" min="0" value="0">
+    <button id="startEditBtn">Start editing</button>
+    <button id="resetBtn">Reset Modifications</button>
+    <p id="editInfo"></p>
+  </div>
+
+  <script>
+    // Pixel colors matching the API spec
+    const PIXEL_ON_COLOR = '#48494b';
+    const PIXEL_OFF_COLOR = '#e3e5e4';
+    const PIXEL_SIZE = 10; // scale factor for drawing
+
+    // State variables
+    let pixelStrOriginal = '';
+    let pixelStrCurrent = '';
+    let boundingBox = {minX:0, minY:0, maxX:39, maxY:39};
+    let originalPixelCount = 0;
+    let availableCredits = 0;
+    let addedCount = 0;
+    let subtractedCount = 0;
+    let editing = false;
+
+    // Burn rate: fraction of total pixel count credited when burning Normies (1% => 0.01)
+    const BURN_RATE = 0.01;
+
+    async function fetchNormieMetadata(id) {
+      const url = `https://api.normies.art/normie/${id}/metadata`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`API request failed with status ${res.status}`);
+      }
+      return await res.json();
+    }
+
+    async function fetchNormiePixels(id) {
+      const url = `https://api.normies.art/normie/${id}/pixels`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`Pixel request failed with status ${res.status}`);
+      }
+      const text = await res.text();
+      const pixelStr = text.replace(/\s+/g, '');
+      if (pixelStr.length !== 1600) {
+        throw new Error('Unexpected pixel data length');
+      }
+      return pixelStr;
+    }
+
+    function extractStat(data, traitName) {
+      const attr = data.attributes.find(a => a.trait_type === traitName);
+      return attr ? attr.value : null;
+    }
+
+    function drawCanvas(pixelStr, canvasId) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+      const width = 40;
+      const height = 40;
+      canvas.width = width * PIXEL_SIZE;
+      canvas.height = height * PIXEL_SIZE;
+      for (let i = 0; i < pixelStr.length; i++) {
+        const bit = pixelStr[i];
+        const x = i % width;
+        const y = Math.floor(i / width);
+        ctx.fillStyle = bit === '1' ? PIXEL_ON_COLOR : PIXEL_OFF_COLOR;
+        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+      }
+    }
+
+    function computeBoundingBox(pixelStr) {
+      // Determine bounding box of dark pixels (value=1)
+      let minX = 40, minY = 40, maxX = -1, maxY = -1;
+      for (let i = 0; i < pixelStr.length; i++) {
+        if (pixelStr[i] === '1') {
+          const x = i % 40;
+          const y = Math.floor(i / 40);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+      return {minX, minY, maxX, maxY};
+    }
+
+    function updateEditInfo() {
+      const newPixelCount = originalPixelCount + addedCount - subtractedCount;
+      document.getElementById('editInfo').innerHTML =
+        `Remaining credits: <strong>${availableCredits}</strong><br>` +
+        `Pixels added: <strong>${addedCount}</strong><br>` +
+        `Pixels removed: <strong>${subtractedCount}</strong><br>` +
+        `New pixel count: <strong>${Math.max(0, newPixelCount)}</strong>`;
+    }
+
+    document.getElementById('fetchBtn').addEventListener('click', async () => {
+      const id = Number(document.getElementById('normieId').value);
+      const statusEl = document.getElementById('fetchStatus');
+      const infoEl = document.getElementById('normieInfo');
+      statusEl.textContent = '';
+      infoEl.style.display = 'none';
+      editing = false;
+      if (isNaN(id) || id < 0 || id > 9999) {
+        statusEl.textContent = 'Please enter a valid Normie ID between 0 and 9999.';
+        statusEl.className = 'error';
+        return;
+      }
+      statusEl.textContent = 'Fetching...';
+      statusEl.className = '';
+      try {
+        const [meta, pixelStr] = await Promise.all([
+          fetchNormieMetadata(id),
+          fetchNormiePixels(id)
+        ]);
+        const pixelCount = extractStat(meta, 'Pixel Count');
+        const level = extractStat(meta, 'Level');
+        if (pixelCount == null || level == null) {
+          throw new Error('Pixel Count or Level not found in metadata.');
+        }
+        document.getElementById('normiePixels').textContent = pixelCount;
+        document.getElementById('normieLevel').textContent = level;
+        // Set initial state
+        pixelStrOriginal = pixelStr;
+        pixelStrCurrent = pixelStr;
+        originalPixelCount = Number(pixelCount);
+        boundingBox = computeBoundingBox(pixelStrOriginal);
+        availableCredits = 0;
+        addedCount = 0;
+        subtractedCount = 0;
+        editing = false;
+        document.getElementById('editInfo').textContent = '';
+        document.getElementById('editCredits').value = 0;
+        statusEl.textContent = '';
+        infoEl.style.display = 'block';
+        // Draw original Normie on both canvases
+        drawCanvas(pixelStrOriginal, 'originalCanvas');
+        drawCanvas(pixelStrCurrent, 'modifiedCanvas');
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message + '. If you encounter CORS issues, try using a proxy or run this page through a local server.';
+        statusEl.className = 'error';
+      }
+    });
+
+    // Burn computation button handler
+    document.getElementById('burnBtn').addEventListener('click', async () => {
+      const idsStr = document.getElementById('burnIds').value;
+      const statusEl = document.getElementById('burnStatus');
+      const infoEl = document.getElementById('burnInfo');
+      statusEl.textContent = '';
+      infoEl.innerHTML = '';
+      if (!idsStr.trim()) {
+        statusEl.textContent = 'Please enter at least one Normie ID to burn.';
+        statusEl.className = 'error';
+        return;
+      }
+      // Parse IDs
+      const ids = idsStr.split(/[,\s]+/).map(s => s.trim()).filter(s => s !== '');
+      const uniqueIds = [];
+      for (const s of ids) {
+        const n = Number(s);
+        if (isNaN(n) || n < 0 || n > 9999) {
+          statusEl.textContent = `Invalid ID: ${s}. Please use numbers between 0 and 9999.`;
+          statusEl.className = 'error';
+          return;
+        }
+        if (!uniqueIds.includes(n)) uniqueIds.push(n);
+      }
+      statusEl.textContent = 'Fetching pixel counts...';
+      statusEl.className = '';
+      try {
+        // Fetch metadata for each ID
+        const results = [];
+        for (const id of uniqueIds) {
+          const meta = await fetchNormieMetadata(id);
+          const pixelCount = extractStat(meta, 'Pixel Count');
+          if (pixelCount == null) {
+            throw new Error(`Pixel Count not found for token ${id}`);
+          }
+          results.push({ id, pixelCount: Number(pixelCount) });
+        }
+        // Sum pixel counts
+        const totalPixels = results.reduce((sum, r) => sum + r.pixelCount, 0);
+        const credits = Math.ceil(totalPixels * BURN_RATE);
+        // Build info HTML
+        let html = '<h3>Burn Summary</h3>';
+        html += '<ul style="padding-left: 1.2rem">';
+        for (const r of results) {
+          html += `<li>Normie #${r.id}: ${r.pixelCount} pixels</li>`;
+        }
+        html += '</ul>';
+        html += `<p><strong>Total pixel count:</strong> ${totalPixels}</p>`;
+        html += `<p><strong>Edit credits (1% of total, rounded up):</strong> ${credits}</p>`;
+        infoEl.innerHTML = html;
+        // Pre-fill credits input
+        document.getElementById('editCredits').value = credits;
+        statusEl.textContent = 'Credits computed. You can now start editing.';
+        statusEl.className = '';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'error';
+      }
+    });
+
+    document.getElementById('startEditBtn').addEventListener('click', () => {
+      const credits = Number(document.getElementById('editCredits').value);
+      const resultEl = document.getElementById('editInfo');
+      if (isNaN(credits) || credits < 0) {
+        resultEl.textContent = 'Please enter a non‑negative number of credits.';
+        return;
+      }
+      if (pixelStrCurrent === '') {
+        resultEl.textContent = 'Please fetch a Normie first.';
+        return;
+      }
+      availableCredits = credits;
+      addedCount = 0;
+      subtractedCount = 0;
+      editing = true;
+      updateEditInfo();
+    });
+
+    // Reset button to revert all modifications
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      if (pixelStrOriginal === '' || pixelStrCurrent === '') return;
+      pixelStrCurrent = pixelStrOriginal;
+      // restore credits to initial value specified in editCredits input
+      availableCredits = Number(document.getElementById('editCredits').value);
+      addedCount = 0;
+      subtractedCount = 0;
+      editing = true;
+      drawCanvas(pixelStrCurrent, 'modifiedCanvas');
+      updateEditInfo();
+    });
+
+    // Disable the context menu on the modified canvas. Without this, a ctrl+click
+    // (or right‑click on some platforms) will trigger the browser’s context
+    // menu, preventing our custom undo logic from running. By cancelling the
+    // default contextmenu event we ensure modifier clicks are handled purely
+    // by our code.
+    document.getElementById('modifiedCanvas').addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+    });
+
+    // Mouse click handler for editing
+    document.getElementById('modifiedCanvas').addEventListener('click', (event) => {
+      // Only handle clicks if editing is active
+      if (!editing) {
+        return;
+      }
+      // Prevent the default action on ctrl/meta/right clicks to avoid context menus
+      // interfering with our custom logic. This covers ctrl+click on Mac
+      // (which normally opens the context menu) and right‑clicks.
+      if (event.ctrlKey || event.metaKey || event.button === 2) {
+        event.preventDefault();
+      }
+      const canvas = event.currentTarget;
+      const rect = canvas.getBoundingClientRect();
+      const xPixel = Math.floor((event.clientX - rect.left) / PIXEL_SIZE);
+      const yPixel = Math.floor((event.clientY - rect.top) / PIXEL_SIZE);
+      // Check if inside bounding box
+      if (xPixel < boundingBox.minX || xPixel > boundingBox.maxX || yPixel < boundingBox.minY || yPixel > boundingBox.maxY) {
+        return;
+      }
+      const index = yPixel * 40 + xPixel;
+      const currentBit = pixelStrCurrent[index];
+      const originalBit = pixelStrOriginal[index];
+      // Undo operation: triggered by holding Ctrl or Meta (Command) key, or
+      // right‑click (button 2). Revert the pixel to its original state and
+      // refund one credit if it was previously modified.
+      if (event.ctrlKey || event.metaKey || event.button === 2) {
+        // Only undo if the pixel has been modified
+        if (currentBit !== originalBit) {
+          if (originalBit === '0' && currentBit === '1') {
+            // Revert an added pixel back to off
+            pixelStrCurrent = pixelStrCurrent.substring(0, index) + '0' + pixelStrCurrent.substring(index + 1);
+            addedCount = Math.max(0, addedCount - 1);
+            availableCredits++;
+          } else if (originalBit === '1' && currentBit === '0') {
+            // Revert a removed pixel back to on
+            pixelStrCurrent = pixelStrCurrent.substring(0, index) + '1' + pixelStrCurrent.substring(index + 1);
+            subtractedCount = Math.max(0, subtractedCount - 1);
+            availableCredits++;
+          }
+          drawCanvas(pixelStrCurrent, 'modifiedCanvas');
+          updateEditInfo();
+        }
+        return;
+      }
+      // Add or remove depending on Shift key, only if credits available
+      if (availableCredits <= 0) {
+        return;
+      }
+      if (event.shiftKey) {
+        // remove pixel (only if it's currently on)
+        if (currentBit === '1') {
+          pixelStrCurrent = pixelStrCurrent.substring(0, index) + '0' + pixelStrCurrent.substring(index + 1);
+          subtractedCount++;
+          availableCredits--;
+          drawCanvas(pixelStrCurrent, 'modifiedCanvas');
+          updateEditInfo();
+        }
+      } else {
+        // add pixel (only if it's currently off)
+        if (currentBit === '0') {
+          pixelStrCurrent = pixelStrCurrent.substring(0, index) + '1' + pixelStrCurrent.substring(index + 1);
+          addedCount++;
+          availableCredits--;
+          drawCanvas(pixelStrCurrent, 'modifiedCanvas');
+          updateEditInfo();
+        }
+      }
+    });
+  </script>
+</body>
+</html>
